@@ -1,3 +1,4 @@
+#include "../third_party/nvidia/include/TritonNVIDIAGPUToLLVM/Utility.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/Dialect.h"
@@ -11,7 +12,7 @@ using namespace mlir;
 namespace {
 
 struct TestMembarPass
-    : public PassWrapper<TestMembarPass, OperationPass<func::FuncOp>> {
+    : public PassWrapper<TestMembarPass, OperationPass<ModuleOp>> {
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestMembarPass);
 
@@ -22,17 +23,12 @@ struct TestMembarPass
 
   void runOnOperation() override {
     Operation *operation = getOperation();
-    auto &os = llvm::errs();
-    // Convert to std::string can remove quotes from op_name
-    auto opName = SymbolTable::getSymbolName(operation).getValue().str();
-    os << opName << "\n";
-
+    ModuleOp moduleOp = cast<ModuleOp>(operation);
     // Print all ops after membar pass
-    Allocation allocation(operation);
-    MembarAnalysis membarPass(&allocation);
+    ModuleAllocation allocation(moduleOp);
+    ModuleMembarAnalysis membarPass(&allocation,
+                                    mlir::triton::NVIDIA::canSkipBarSync);
     membarPass.run();
-
-    os << *operation << "\n";
   }
 };
 

@@ -63,11 +63,12 @@ private:
 // Shared Memory Alias Analysis
 //===----------------------------------------------------------------------===//
 class SharedMemoryAliasAnalysis
-    : public dataflow::SparseDataFlowAnalysis<dataflow::Lattice<AliasInfo>> {
+    : public dataflow::SparseForwardDataFlowAnalysis<
+          dataflow::Lattice<AliasInfo>> {
 public:
-  using dataflow::SparseDataFlowAnalysis<
-      dataflow::Lattice<AliasInfo>>::SparseDataFlowAnalysis;
-  using dataflow::SparseDataFlowAnalysis<
+  using dataflow::SparseForwardDataFlowAnalysis<
+      dataflow::Lattice<AliasInfo>>::SparseForwardDataFlowAnalysis;
+  using dataflow::SparseForwardDataFlowAnalysis<
       dataflow::Lattice<AliasInfo>>::getLatticeElement;
 
   /// XXX(Keren): Compatible interface with MLIR AliasAnalysis for future use.
@@ -78,13 +79,13 @@ public:
   ModRefResult getModRef(Operation *op, Value location);
 
   void setToEntryState(dataflow::Lattice<AliasInfo> *lattice) override {
-    propagateIfChanged(
-        lattice, lattice->join(
-                     AliasInfo::getPessimisticValueState(lattice->getPoint())));
+    propagateIfChanged(lattice,
+                       lattice->join(AliasInfo::getPessimisticValueState(
+                           lattice->getAnchor())));
   }
 
   /// Computes if the alloc set of the results are changed.
-  void
+  LogicalResult
   visitOperation(Operation *op,
                  ArrayRef<const dataflow::Lattice<AliasInfo> *> operands,
                  ArrayRef<dataflow::Lattice<AliasInfo> *> results) override;

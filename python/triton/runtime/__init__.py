@@ -1,12 +1,23 @@
-from .autotuner import Config, Heuristics, autotune, heuristics
-from .jit import JITFunction, KernelInterface, version_key
+from .autotuner import (Autotuner, Config, Heuristics, autotune, heuristics)
+from .cache import RedisRemoteCacheBackend, RemoteCacheBackend
+from .driver import driver
+from .jit import JITFunction, KernelInterface, MockTensor, TensorWrapper, reinterpret
+from .errors import OutOfResources, InterpreterError
 
 __all__ = [
-    "Config",
-    "Heuristics",
     "autotune",
+    "Autotuner",
+    "Config",
+    "driver",
+    "Heuristics",
     "heuristics",
+    "InterpreterError",
     "JITFunction",
     "KernelInterface",
-    "version_key",
+    "MockTensor",
+    "OutOfResources",
+    "RedisRemoteCacheBackend",
+    "reinterpret",
+    "RemoteCacheBackend",
+    "TensorWrapper",
 ]

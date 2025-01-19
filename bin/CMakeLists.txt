@@ -1,20 +1,15 @@
-add_subdirectory(FileCheck)
-# add_llvm_executable(FileCheck FileCheck/FileCheck.cpp)
-# target_link_libraries(FileCheck PRIVATE LLVMFileCheck LLVMSupport)
-
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
+get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
 
 add_llvm_executable(triton-opt triton-opt.cpp PARTIAL_SOURCES_INTENDED)
 
 # TODO: what's this?
 llvm_update_compile_flags(triton-opt)
 target_link_libraries(triton-opt PRIVATE
-  TritonAnalysis
-  TritonTransforms
-  TritonGPUTransforms
   ${dialect_libs}
   ${conversion_libs}
+  ${triton_libs}
   # tests
   TritonTestAnalysis
   # MLIR core
@@ -25,37 +20,66 @@ target_link_libraries(triton-opt PRIVATE
 
 mlir_check_all_link_libraries(triton-opt)
 
+add_llvm_executable(triton-reduce triton-reduce.cpp PARTIAL_SOURCES_INTENDED)
+mlir_check_all_link_libraries(triton-reduce)
 
-add_llvm_executable(triton-translate triton-translate.cpp PARTIAL_SOURCES_INTENDED)
-llvm_update_compile_flags(triton-translate)
- target_link_libraries(triton-translate PRIVATE
-         TritonAnalysis
-         TritonTransforms
-         TritonGPUTransforms
-         TritonLLVMIR
-         TritonPTX
-         ${dialect_libs}
-         ${conversion_libs}
-         # tests
-         TritonTestAnalysis
+llvm_update_compile_flags(triton-reduce)
+target_link_libraries(triton-reduce PRIVATE
+  ${dialect_libs}
+  ${conversion_libs}
+  ${triton_libs}
+  # tests
+  TritonTestAnalysis
+  # MLIR core
+  MLIRReduceLib
+  MLIRPass
+  MLIRTransforms
+)
 
-         LLVMCore
-         LLVMSupport
-         LLVMOption
-         LLVMCodeGen
-         LLVMAsmParser
+mlir_check_all_link_libraries(triton-reduce)
 
-         # MLIR core
-         MLIROptLib
-         MLIRIR
-         MLIRLLVMDialect
-         MLIRPass
-         MLIRSupport
-         MLIRTransforms
-         MLIRExecutionEngine
-         MLIRMathToLLVM
-         MLIRTransformUtils
-         MLIRLLVMToLLVMIRTranslation
-         MLIRNVVMToLLVMIRTranslation
-         )
-mlir_check_all_link_libraries(triton-translate)
+add_llvm_executable(triton-lsp triton-lsp.cpp PARTIAL_SOURCES_INTENDED)
+
+llvm_update_compile_flags(triton-lsp)
+target_link_libraries(triton-lsp PRIVATE
+  ${dialect_libs}
+  ${conversion_libs}
+  ${triton_libs}
+  # tests
+  TritonTestAnalysis
+  # MLIR core
+  MLIRLspServerLib
+  MLIRPass
+  MLIRTransforms
+)
+
+mlir_check_all_link_libraries(triton-lsp)
+
+
+add_llvm_executable(triton-llvm-opt
+  triton-llvm-opt.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  DEPENDS
+  intrinsics_gen
+  SUPPORT_PLUGINS
+  )
+target_link_libraries(triton-llvm-opt PRIVATE
+  TritonLLVMIR
+
+  LLVMAnalysis
+  LLVMCore
+  LLVMSupport
+  LLVMOption
+  LLVMCodeGen
+  )
+export_executable_symbols_for_plugins(triton-llvm-opt)
+
+
+add_llvm_executable(triton-tensor-layout triton-tensor-layout.cpp PARTIAL_SOURCES_INTENDED)
+target_link_libraries(triton-tensor-layout PRIVATE
+  ${triton_libs}
+  ${conversion_libs}
+  ${dialect_libs}
+  TritonTestAnalysis
+  )

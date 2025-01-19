@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # Triton documentation build configuration file, created by
@@ -23,40 +22,104 @@
 
 # -- General configuration ------------------------------------------------
 
+import os
+import platform
+import shutil
+import sys
+import sysconfig
+from pathlib import Path
 
+import sphinx_rtd_theme
+from sphinx_gallery.sorting import FileNameSortKey
 
 
 def process_sig(app, what, name, obj, options, signature, return_annotation):
     if signature and '_builder' in signature:
-        signature = signature.split('_builder')[0] + ")" 
+        signature = signature.split('_builder')[0] + ")"
     return (signature, return_annotation)
+
+
+def get_cmake_dir():
+    plat_name = sysconfig.get_platform()
+    python_version = sysconfig.get_python_version()
+    dir_name = f"cmake.{plat_name}-{sys.implementation.name}-{python_version}"
+    cmake_dir = Path("../python") / "build" / dir_name
+    return cmake_dir
+
+
+def setup_generated_mlir_docs():
+    dst_path = Path("dialects")
+    os.makedirs(dst_path, exist_ok=True)
+
+    cmake_dir = get_cmake_dir()
+    src_dir = cmake_dir / "docs" / "dialects"
+    assert os.path.isdir(src_dir)
+
+    shutil.copytree(src_dir, dst_path, dirs_exist_ok=True)
+
+    files = os.listdir(dst_path)
+
+    dialects = "\n   ".join(["./" + f for f in files if "Dialect" in f])
+    ops = [f for f in files if "Ops" in f]
+
+    # Add titles
+    for op in ops:
+        with open(dst_path / op, 'r+') as f:
+            lines = f.readlines()
+            lines.insert(0, "# " + op.split(".md")[0])
+            f.seek(0)
+            f.writelines(lines)
+    ops = "\n   ".join(["./" + op for op in ops])
+
+    rst_string = f"""
+Triton MLIR Dialects and Ops
+=====================
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Dialects
+
+   {dialects}
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Dialect Ops
+
+   {ops}
+"""
+    with open(dst_path / "dialects.rst", "w+") as f:
+        f.write(rst_string)
+
 
 def setup(app):
     """Customize function args retrieving to get args under decorator."""
+    import subprocess
+
     import sphinx
-    import os
 
     app.connect("autodoc-process-signature", process_sig)
-    os.system("pip install -e ../python")
+    max_jobs = os.getenv("MAX_JOBS", str(2 * os.cpu_count()))
+    print(f"Installing Triton Python package using {max_jobs} threads")
+    subprocess.run("pip install -e ../python", shell=True, env=os.environ.copy())
 
+    setup_generated_mlir_docs()
 
     def forward_jit_fn(func):
         old = func
 
         def wrapped(obj, **kwargs):
             import triton
-            if isinstance(obj, triton.code_gen.JITFunction):
+            if isinstance(obj, triton.runtime.JITFunction):
                 obj = obj.fn
             return old(obj)
 
         return wrapped
 
-
     old_documenter = sphinx.ext.autosummary.get_documenter
 
     def documenter(app, obj, parent):
         import triton
-        if isinstance(obj, triton.code_gen.JITFunction):
+        if isinstance(obj, triton.runtime.JITFunction):
             obj = obj.fn
         return old_documenter(app, obj, parent)
 
@@ -67,15 +130,23 @@ def setup(app):
 
 
 # Auto Doc
-import sys
-import os
+
 sys.path.insert(0, os.path.abspath('../python/'))
-extensions = ['sphinx.ext.autodoc', 'sphinx.ext.intersphinx', 'sphinx.ext.autosummary', 'sphinx.ext.coverage', 'sphinx.ext.napoleon', 'sphinx_multiversion']
+extensions = [
+    'sphinx.ext.autodoc',
+    'sphinx.ext.intersphinx',
+    'sphinx.ext.autosummary',
+    'sphinx.ext.coverage',
+    'sphinx.ext.napoleon',
+    'sphinx_multiversion',
+    'sphinx.ext.autosectionlabel',
+    'myst_parser',
+]
 autosummary_generate = True
 
 # versioning config
-smv_tag_whitelist = r'^(v1.1.2)$'
-smv_branch_whitelist = r'^master$'
+smv_tag_whitelist = r'^(v3.2.0)$'
+smv_branch_whitelist = r'^main$'
 smv_remote_whitelist = None
 smv_released_pattern = r'^tags/.*$'
 smv_outputdir_format = '{ref.name}'
@@ -83,16 +154,19 @@ smv_prefer_remote_refs = False
 
 # Sphinx gallery
 extensions += ['sphinx_gallery.gen_gallery']
-from sphinx_gallery.sorting import FileNameSortKey
+
 sphinx_gallery_conf = {
     'examples_dirs': '../python/tutorials/',
     'gallery_dirs': 'getting-started/tutorials',
     'filename_pattern': '',
-    'ignore_pattern': r'__init__\.py',
+    'ignore_pattern': r'(__init__\.py|11.*.py)',
     'within_subsection_order': FileNameSortKey,
     'reference_url': {
         'sphinx_gallery': None,
-    }
+    },
+    # Examples don't work on non-Linux platforms, because they actually run
+    # Triton.  But it's nice to be able to run the rest of the docs build.
+    'abort_on_example_error': platform.system() == 'Linux',
 }
 
 # Add any paths that contain templates here, relative to this directory.
@@ -131,7 +205,7 @@ release = ''
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = 'en'
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -149,7 +223,7 @@ todo_include_todos = False
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-import sphinx_rtd_theme
+
 html_theme = 'sphinx_rtd_theme'
 html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
@@ -178,6 +252,8 @@ html_sidebars = {
         'searchbox.html',
     ]
 }
+
+html_logo = "https://cdn.openai.com/triton/assets/triton-logo.png"
 
 # -- Options for HTMLHelp output ------------------------------------------
 
@@ -223,5 +299,6 @@ man_pages = [(master_doc, 'triton', 'Triton Documentation', [author], 1)]
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-    (master_doc, 'Triton', 'Triton Documentation', author, 'Triton', 'One line description of project.', 'Miscellaneous'),
+    (master_doc, 'Triton', 'Triton Documentation', author, 'Triton', 'One line description of project.',
+     'Miscellaneous'),
 ]

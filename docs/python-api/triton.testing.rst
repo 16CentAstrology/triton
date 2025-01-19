@@ -1,5 +1,5 @@
 triton.testing
-================
+==============
 
 .. currentmodule:: triton.testing
 
@@ -7,6 +7,8 @@ triton.testing
     :toctree: generated
     :nosignatures:
 
-    do_bench
     Benchmark
+    do_bench
+    do_bench_cudagraph
     perf_report
+    assert_close

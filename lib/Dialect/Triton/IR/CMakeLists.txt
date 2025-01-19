@@ -1,9 +1,9 @@
-add_mlir_dialect_library(TritonIR
-  Interfaces.cpp
+add_triton_library(TritonIR
   Dialect.cpp
   Ops.cpp
-  Types.cpp
   Traits.cpp
+  Types.cpp
+  OpInterfaces.cpp
 
   DEPENDS
   TritonTableGen
@@ -11,6 +11,6 @@ add_mlir_dialect_library(TritonIR
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRArithDialect
+  MLIRMathDialect
   MLIRSCFDialect
-  MLIRFuncDialect
 )

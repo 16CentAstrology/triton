@@ -9,11 +9,18 @@ using namespace mlir;
 namespace {
 
 struct TestAliasPass
-    : public PassWrapper<TestAliasPass, OperationPass<func::FuncOp>> {
+    : public PassWrapper<TestAliasPass, OperationPass<triton::FuncOp>> {
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestAliasPass);
 
-  static void print(StringRef name, SmallVector<std::string, 4> &vals,
+  static std::string getValueOperandName(Value value, AsmState &state) {
+    std::string opName;
+    llvm::raw_string_ostream ss(opName);
+    value.printAsOperand(ss, state);
+    return opName;
+  }
+
+  static void print(StringRef name, SmallVector<std::string> &vals,
                     raw_ostream &os) {
     if (vals.empty())
       return;
@@ -47,10 +54,10 @@ struct TestAliasPass
 
     AsmState state(operation->getParentOfType<ModuleOp>());
     // Get operation ids of value's aliases
-    auto getAllocOpNames = [&](Value value) {
+    auto getLocalAllocOpNames = [&](Value value) {
       dataflow::Lattice<AliasInfo> *latticeElement =
           analysis->getLatticeElement(value);
-      SmallVector<std::string, 4> opNames;
+      SmallVector<std::string> opNames;
       if (latticeElement) {
         auto &info = latticeElement->getValue();
         for (auto &alias : info.getAllocs()) {
@@ -71,7 +78,7 @@ struct TestAliasPass
           auto *block = branch->getBlock();
           for (auto arg : llvm::enumerate(block->getArguments())) {
             auto operand = block->getArgument(arg.index());
-            auto opNames = getAllocOpNames(operand);
+            auto opNames = getLocalAllocOpNames(operand);
             auto argName = getValueOperandName(arg.value(), state);
             print(argName, opNames, os);
           }
@@ -80,14 +87,14 @@ struct TestAliasPass
       }
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         for (auto arg : llvm::enumerate(forOp.getRegionIterArgs())) {
-          auto operand = forOp.getOpOperandForRegionIterArg(arg.value()).get();
-          auto opNames = getAllocOpNames(operand);
+          auto operand = forOp.getTiedLoopInit(arg.value())->get();
+          auto opNames = getLocalAllocOpNames(operand);
           auto argName = getValueOperandName(arg.value(), state);
           print(argName, opNames, os);
         }
       }
       for (auto result : llvm::enumerate(op->getResults())) {
-        auto opNames = getAllocOpNames(result.value());
+        auto opNames = getLocalAllocOpNames(result.value());
         auto resultName = getValueOperandName(result.value(), state);
         print(resultName, opNames, os);
       }

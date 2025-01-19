@@ -27,9 +27,9 @@ lib/Analysis/Utility.cpp @Jokeren
 # Dialects
 # ----------
 # Pipeline pass
-lib/Dialect/TritonGPU/Transforms/Pipeline.cpp @daadaada
+lib/Dialect/TritonGPU/Transforms/Pipeline.cpp @ptillet
 # Prefetch pass
-lib/Dialect/TritonGPU/Transforms/Prefetch.cpp @daadaada
+lib/Dialect/TritonGPU/Transforms/Prefetch.cpp @ptillet
 # Coalesce pass
 lib/Dialect/TritonGPU/Transforms/Coalesce.cpp @ptillet
 # Layout simplification pass
@@ -38,20 +38,11 @@ lib/Dialect/TritonGPU/Transforms/Combine.cpp @ptillet
 # -----------
 # Conversions
 # -----------
-# TritonGPUToLLVM
-include/triton/Conversion/TritonGPUToLLVM/ @goostavz @Superjomn
-lib/Conversions/TritonGPUToLLVM @goostavz @Superjomn
 # TritonToTritonGPU
-include/triton/Conversion/TritonToTritonGPU/ @daadaada
-lib/Dialect/TritonGPU/Transforms/TritonGPUConversion.cpp @daadaada
+include/triton/Conversion/TritonToTritonGPU/ @ptillet
+lib/Dialect/TritonGPU/Transforms/TritonGPUConversion.cpp @ptillet
 
-
-# -------
-# Targets
-# -------
-# LLVMIR
-include/triton/Target/LLVMIR/ @goostavz @Superjomn
-lib/Target/LLVMIR @goostavz @Superjomn
-# PTX
-include/triton/Target/PTX/ @goostavz @Superjomn
-lib/Target/PTX @goostavz @Superjomn
+# -----------
+# third_party
+# -----------
+third_party/amd/ @antiagainst @zhanglx13

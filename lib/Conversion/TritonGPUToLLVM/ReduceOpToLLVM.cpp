@@ -1,390 +1,61 @@
-#include "ReduceOpToLLVM.h"
+#include "ReduceScanCommon.h"
+#include "mlir/Support/LLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 using namespace mlir;
 using namespace mlir::triton;
 
-using ::mlir::LLVM::getElementsFromStruct;
-using ::mlir::LLVM::getStructFromElements;
-using ::mlir::LLVM::shflSync;
-using ::mlir::LLVM::storeShared;
-using ::mlir::triton::gpu::getElemsPerThread;
+using ::mlir::LLVM::linearize;
+using ::mlir::triton::gpu::DistributedEncodingTrait;
 using ::mlir::triton::gpu::getOrder;
+using ::mlir::triton::gpu::getThreadOrder;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 
+namespace {
 struct ReduceOpConversion
-    : public ConvertTritonGPUOpToLLVMPattern<triton::ReduceOp> {
+    : public ConvertTritonGPUReduceScanToLLVMPattern<triton::ReduceOp> {
 public:
-  using ConvertTritonGPUOpToLLVMPattern<
-      triton::ReduceOp>::ConvertTritonGPUOpToLLVMPattern;
+  ReduceOpConversion(LLVMTypeConverter &typeConverter,
+                     const TargetInfoBase &targetInfo, PatternBenefit benefit)
+      : ConvertTritonGPUReduceScanToLLVMPattern<triton::ReduceOp>(typeConverter,
+                                                                  benefit),
+        targetInfo(targetInfo) {}
 
   LogicalResult
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (ReduceOpHelper(op).isFastReduction())
-      return matchAndRewriteFast(op, adaptor, rewriter);
-    return matchAndRewriteBasic(op, adaptor, rewriter);
-  }
-
-private:
-  void accumulate(ConversionPatternRewriter &rewriter, Location loc,
-                  RedOp redOp, Value &acc, Value cur, bool isFirst) const {
-    if (isFirst) {
-      acc = cur;
-      return;
-    }
-    switch (redOp) {
-    case RedOp::ADD:
-      acc = add(acc, cur);
-      break;
-    case RedOp::FADD:
-      acc = fadd(acc.getType(), acc, cur);
-      break;
-    case RedOp::MIN:
-      acc = smin(acc, cur);
-      break;
-    case RedOp::MAX:
-      acc = smax(acc, cur);
-      break;
-    case RedOp::UMIN:
-      acc = umin(acc, cur);
-      break;
-    case RedOp::UMAX:
-      acc = umax(acc, cur);
-      break;
-    case RedOp::FMIN:
-      acc = fmin(acc, cur);
-      break;
-    case RedOp::FMAX:
-      acc = fmax(acc, cur);
-      break;
-    case RedOp::XOR:
-      acc = xor_(acc, cur);
-      break;
-    case RedOp::ARGMIN:
-    case RedOp::ARGMAX:
-    case RedOp::ARGUMIN:
-    case RedOp::ARGUMAX:
-    case RedOp::ARGFMIN:
-    case RedOp::ARGFMAX:
-      llvm::report_fatal_error(
-          "This accumulate implementation is not for argmin / argmax");
-    default:
-      llvm::report_fatal_error("Unsupported reduce op");
-    }
-  }
-
-  void accumulateWithIndex(ConversionPatternRewriter &rewriter, Location loc,
-                           RedOp redOp, Value &acc, Value &accIndex, Value cur,
-                           Value curIndex, bool isFirst) const {
-    if (isFirst) {
-      acc = cur;
-      accIndex = curIndex;
-      return;
-    }
-    switch (redOp) {
-    case RedOp::ARGMIN:
-      accIndex = select(
-          icmp_slt(acc, cur), accIndex,
-          select(icmp_sgt(acc, cur), curIndex, smin(accIndex, curIndex)));
-      acc = smin(acc, cur);
-      break;
-    case RedOp::ARGMAX:
-      accIndex = select(
-          icmp_sgt(acc, cur), accIndex,
-          select(icmp_slt(acc, cur), curIndex, smin(accIndex, curIndex)));
-      acc = smax(acc, cur);
-      break;
-    case RedOp::ARGUMIN:
-      accIndex = select(
-          icmp_ult(acc, cur), accIndex,
-          select(icmp_ugt(acc, cur), curIndex, smin(accIndex, curIndex)));
-      acc = umin(acc, cur);
-      break;
-    case RedOp::ARGUMAX:
-      accIndex = select(
-          icmp_ugt(acc, cur), accIndex,
-          select(icmp_ult(acc, cur), curIndex, smin(accIndex, curIndex)));
-      acc = umax(acc, cur);
-      break;
-    case RedOp::ARGFMIN:
-      accIndex = select(
-          fcmp_olt(acc, cur), accIndex,
-          select(fcmp_ogt(acc, cur), curIndex, smin(accIndex, curIndex)));
-      acc = fmin(acc, cur);
-      break;
-    case RedOp::ARGFMAX:
-      accIndex = select(
-          fcmp_ogt(acc, cur), accIndex,
-          select(fcmp_olt(acc, cur), curIndex, smin(accIndex, curIndex)));
-      acc = fmax(acc, cur);
-      break;
-    case RedOp::ADD:
-    case RedOp::FADD:
-    case RedOp::MIN:
-    case RedOp::MAX:
-    case RedOp::UMIN:
-    case RedOp::UMAX:
-    case RedOp::FMIN:
-    case RedOp::FMAX:
-    case RedOp::XOR:
-      llvm::report_fatal_error(
-          "This accumulate implementation is only for argmin / argmax");
-    default:
-      llvm::report_fatal_error("Unsupported reduce op");
-    }
-  }
-
-  // Use shared memory for reduction within warps and across warps
-  LogicalResult
-  matchAndRewriteBasic(triton::ReduceOp op, OpAdaptor adaptor,
-                       ConversionPatternRewriter &rewriter) const {
-    Location loc = op->getLoc();
-    unsigned axis = op.getAxis();
-    bool withIndex = triton::ReduceOp::withIndex(op.getRedOp());
-
-    auto srcTy = op.getOperand().getType().cast<RankedTensorType>();
-    auto srcLayout = srcTy.getEncoding().cast<BlockedEncodingAttr>();
-    auto srcOrd = srcLayout.getOrder();
-    auto srcShape = srcTy.getShape();
-
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-    auto llvmIndexTy = getTypeConverter()->getIndexType();
-    auto elemPtrTy = LLVM::LLVMPointerType::get(llvmElemTy, 3);
-    auto indexPtrTy = LLVM::LLVMPointerType::get(llvmIndexTy, 3);
-    Value smemBase = getSharedMemoryBase(loc, rewriter, op.getOperation());
-    smemBase = bitcast(smemBase, elemPtrTy);
-
     ReduceOpHelper helper(op);
-    auto smemShape = helper.getScratchConfigBasic();
-    unsigned elems = product<unsigned>(smemShape);
-    Value indexSmemBase = gep(elemPtrTy, smemBase, i32_val(elems));
-    indexSmemBase = bitcast(indexSmemBase, indexPtrTy);
-
-    unsigned srcElems = getElemsPerThread(srcTy);
-    auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcShape);
-    auto srcValues = getElementsFromStruct(loc, adaptor.getOperand(), rewriter);
-
-    SmallVector<SmallVector<unsigned>> offset =
-        emitOffsetForLayout(srcLayout, srcShape);
-
-    std::map<SmallVector<unsigned>, Value> accs;
-    std::map<SmallVector<unsigned>, Value> accIndices;
-    std::map<SmallVector<unsigned>, SmallVector<Value>> indices;
-
-    // reduce within threads
-    for (unsigned i = 0; i < srcElems; ++i) {
-      SmallVector<unsigned> key = offset[i];
-      key[axis] = 0;
-      bool isFirst = accs.find(key) == accs.end();
-      if (!withIndex) {
-        accumulate(rewriter, loc, op.getRedOp(), accs[key], srcValues[i],
-                   isFirst);
-      } else {
-        Value curIndex = srcIndices[i][axis];
-        accumulateWithIndex(rewriter, loc, op.getRedOp(), accs[key],
-                            accIndices[key], srcValues[i], curIndex, isFirst);
-      }
-      if (isFirst)
-        indices[key] = srcIndices[i];
-    }
-
-    // cached int32 constants
-    std::map<int, Value> ints;
-    ints[0] = i32_val(0);
-    for (int N = smemShape[axis] / 2; N > 0; N >>= 1)
-      ints[N] = i32_val(N);
-    Value sizePerThread = i32_val(srcLayout.getSizePerThread()[axis]);
-
-    // reduce across threads
-    for (auto it : accs) {
-      const SmallVector<unsigned> &key = it.first;
-      Value acc = it.second;
-      Value accIndex;
-      if (withIndex)
-        accIndex = accIndices[key];
-      SmallVector<Value> writeIdx = indices[key];
-
-      writeIdx[axis] = udiv(writeIdx[axis], sizePerThread);
-      Value writeOffset = linearize(rewriter, loc, writeIdx, smemShape, srcOrd);
-      Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
-      Value indexWritePtr = gep(indexPtrTy, indexSmemBase, writeOffset);
-      store(acc, writePtr);
-      if (withIndex)
-        store(accIndex, indexWritePtr);
-
-      SmallVector<Value> readIdx(writeIdx.size(), ints[0]);
-      for (int N = smemShape[axis] / 2; N > 0; N >>= 1) {
-        readIdx[axis] = ints[N];
-        Value readMask = icmp_slt(writeIdx[axis], ints[N]);
-        Value readOffset = select(
-            readMask, linearize(rewriter, loc, readIdx, smemShape, srcOrd),
-            ints[0]);
-        Value readPtr = gep(elemPtrTy, writePtr, readOffset);
-        barrier();
-        if (!withIndex) {
-          Value cur = load(readPtr);
-          accumulate(rewriter, loc, op.getRedOp(), acc, cur, false);
-          barrier();
-          store(acc, writePtr);
-        } else {
-          Value cur = load(readPtr);
-          Value indexReadPtr = gep(indexPtrTy, indexWritePtr, readOffset);
-          Value curIndex = load(indexReadPtr);
-          accumulateWithIndex(rewriter, loc, op.getRedOp(), acc, accIndex, cur,
-                              curIndex, false);
-          barrier();
-          store(acc, writePtr);
-          store(accIndex, indexWritePtr);
-        }
-      }
-    }
-
-    barrier();
-
-    // set output values
-    if (auto resultTy = op.getType().dyn_cast<RankedTensorType>()) {
-      // nd-tensor where n >= 1
-      auto resultLayout = resultTy.getEncoding();
-      auto resultShape = resultTy.getShape();
-
-      unsigned resultElems = getElemsPerThread(resultTy);
-      auto resultIndices =
-          emitIndices(loc, rewriter, resultLayout, resultShape);
-      assert(resultIndices.size() == resultElems);
-
-      SmallVector<Value> resultVals(resultElems);
-      for (unsigned i = 0; i < resultElems; ++i) {
-        SmallVector<Value> readIdx = resultIndices[i];
-        readIdx.insert(readIdx.begin() + axis, ints[0]);
-        Value readOffset = linearize(rewriter, loc, readIdx, smemShape, srcOrd);
-        Value readPtr = gep(elemPtrTy, smemBase, readOffset);
-        Value indexReadPtr = gep(indexPtrTy, indexSmemBase, readOffset);
-        resultVals[i] = withIndex ? load(indexReadPtr) : load(readPtr);
-      }
-
-      SmallVector<Type> resultTypes(resultElems,
-                                    withIndex ? llvmIndexTy : llvmElemTy);
-      Type structTy =
-          LLVM::LLVMStructType::getLiteral(this->getContext(), resultTypes);
-      Value ret = getStructFromElements(loc, resultVals, rewriter, structTy);
-      rewriter.replaceOp(op, ret);
-    } else {
-      // 0d-tensor -> scalar
-      Value resultVal = withIndex ? load(indexSmemBase) : load(smemBase);
-      rewriter.replaceOp(op, resultVal);
-    }
-
-    return success();
-  }
-
-  // Use warp shuffle for reduction within warps and shared memory for data
-  // exchange across warps
-  LogicalResult matchAndRewriteFast(triton::ReduceOp op, OpAdaptor adaptor,
-                                    ConversionPatternRewriter &rewriter) const {
+    assert(helper.isSupportedLayout() &&
+           "Unexpected srcLayout in ReduceOpConversion");
     Location loc = op->getLoc();
-    unsigned axis = adaptor.getAxis();
-    bool withIndex = triton::ReduceOp::withIndex(op.getRedOp());
 
-    auto srcTy = op.getOperand().getType().cast<RankedTensorType>();
-    auto srcLayout = srcTy.getEncoding();
-    auto srcShape = srcTy.getShape();
-    auto order = getOrder(srcLayout);
-
-    auto threadsPerWarp = triton::gpu::getThreadsPerWarp(srcLayout);
-    auto warpsPerCTA = triton::gpu::getWarpsPerCTA(srcLayout);
-
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-    auto llvmIndexTy = getTypeConverter()->getIndexType();
-    auto elemPtrTy = LLVM::LLVMPointerType::get(llvmElemTy, 3);
-    auto indexPtrTy = LLVM::LLVMPointerType::get(llvmIndexTy, 3);
-    Value smemBase = getSharedMemoryBase(loc, rewriter, op.getOperation());
-    smemBase = bitcast(smemBase, elemPtrTy);
-
-    ReduceOpHelper helper(op);
-    auto smemShapes = helper.getScratchConfigsFast();
-    unsigned elems = product<unsigned>(smemShapes[0]);
-    unsigned maxElems = std::max(elems, product<unsigned>(smemShapes[1]));
-    Value indexSmemBase = gep(elemPtrTy, smemBase, i32_val(maxElems));
-    indexSmemBase = bitcast(indexSmemBase, indexPtrTy);
-
-    unsigned sizeIntraWarps = helper.getIntraWarpSize();
-    unsigned sizeInterWarps = helper.getInterWarpSize();
-
-    unsigned srcElems = getElemsPerThread(srcTy);
-    auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcShape);
-    auto srcValues = getElementsFromStruct(loc, adaptor.getOperand(), rewriter);
-
-    SmallVector<SmallVector<unsigned>> offset =
-        emitOffsetForLayout(srcLayout, srcShape);
-
-    std::map<SmallVector<unsigned>, Value> accs;
-    std::map<SmallVector<unsigned>, Value> accIndices;
+    auto srcValues = unpackInputs(loc, op, adaptor, rewriter);
+    std::map<SmallVector<unsigned>, SmallVector<Value>> accs;
     std::map<SmallVector<unsigned>, SmallVector<Value>> indices;
+    // First reduce all the values along axis within each thread.
+    reduceWithinThreads(helper, srcValues, accs, indices, rewriter);
 
-    // reduce within threads
-    for (unsigned i = 0; i < srcElems; ++i) {
-      SmallVector<unsigned> key = offset[i];
-      key[axis] = 0;
-      bool isFirst = accs.find(key) == accs.end();
-      if (!withIndex) {
-        accumulate(rewriter, loc, op.getRedOp(), accs[key], srcValues[i],
-                   isFirst);
-      } else {
-        Value curIndex = srcIndices[i][axis];
-        accumulateWithIndex(rewriter, loc, op.getRedOp(), accs[key],
-                            accIndices[key], srcValues[i], curIndex, isFirst);
-      }
-      if (isFirst)
-        indices[key] = srcIndices[i];
+    // Then reduce across threads within a warp.
+    reduceWithinWarps(helper, accs, rewriter);
+
+    if (helper.isWarpSynchronous()) {
+      // If all the values to be reduced are within the same warp there is
+      // nothing left to do.
+      packResults(helper, accs, rewriter);
+      return success();
     }
 
-    Value threadId = getThreadId(rewriter, loc);
-    Value warpSize = i32_val(32);
-    Value warpId = udiv(threadId, warpSize);
-    Value laneId = urem(threadId, warpSize);
+    // Compute a shared memory base per operand.
+    auto smemShape = helper.getScratchRepShape();
 
-    SmallVector<Value> multiDimLaneId =
-        delinearize(rewriter, loc, laneId, threadsPerWarp, order);
-    SmallVector<Value> multiDimWarpId =
-        delinearize(rewriter, loc, warpId, warpsPerCTA, order);
+    SmallVector<Value> smemBases =
+        getSmemBases(op, product<unsigned>(smemShape), rewriter, targetInfo);
 
-    Value laneIdAxis = multiDimLaneId[axis];
-    Value warpIdAxis = multiDimWarpId[axis];
+    storeWarpReduceToSharedMemory(helper, accs, indices, smemBases, rewriter);
 
-    Value zero = i32_val(0);
-    Value laneZero = icmp_eq(laneIdAxis, zero);
-
-    for (auto it : accs) {
-      const SmallVector<unsigned> &key = it.first;
-      Value acc = it.second;
-      Value accIndex;
-      if (withIndex)
-        accIndex = accIndices[key];
-
-      // Reduce within warps
-      for (unsigned N = sizeIntraWarps / 2; N > 0; N >>= 1) {
-        Value shfl = shflSync(loc, rewriter, acc, N);
-        if (!withIndex) {
-          accumulate(rewriter, loc, op.getRedOp(), acc, shfl, false);
-        } else {
-          Value shflIndex = shflSync(loc, rewriter, accIndex, N);
-          accumulateWithIndex(rewriter, loc, op.getRedOp(), acc, accIndex, shfl,
-                              shflIndex, false);
-        }
-      }
-
-      SmallVector<Value> writeIdx = indices[key];
-      writeIdx[axis] = (sizeInterWarps == 1) ? zero : warpIdAxis;
-      Value writeOffset =
-          linearize(rewriter, loc, writeIdx, smemShapes[0], order);
-      Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
-      storeShared(rewriter, loc, writePtr, acc, laneZero);
-      if (withIndex) {
-        Value indexWritePtr = gep(indexPtrTy, indexSmemBase, writeOffset);
-        storeShared(rewriter, loc, indexWritePtr, accIndex, laneZero);
-      }
-    }
-
-    barrier();
+    sync(rewriter, loc, op);
 
     // The second round of shuffle reduction
     //   now the problem size: sizeInterWarps, s1, s2, .. , sn
@@ -392,99 +63,333 @@ private:
     //
     // Each thread needs to process:
     //   elemsPerThread = sizeInterWarps * s1 * s2 .. Sn / numThreads
-    unsigned numThreads =
-        product<unsigned>(triton::gpu::getWarpsPerCTA(srcLayout)) * 32;
+    accumulatePartialReductions(helper, smemBases, rewriter);
+
+    // We could avoid this barrier in some of the layouts, however this is not
+    // the general case.
+    // TODO: optimize the barrier in case the layouts are accepted.
+    sync(rewriter, loc, op);
+
+    // set output values
+    loadReductionAndPackResult(helper, smemShape, smemBases, rewriter);
+
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+
+  void accumulate(Location loc, ConversionPatternRewriter &rewriter,
+                  Region &combineOp, SmallVector<Value> &acc, ValueRange cur,
+                  Value pred = {}) const {
+    auto results = applyCombineOp(loc, rewriter, combineOp, acc, cur, pred);
+    if (acc.size() < results.size()) {
+      acc.resize(results.size());
+    }
+    for (unsigned i = 0; i < acc.size(); ++i) {
+      acc[i] = results[i];
+    }
+  }
+
+  SmallVector<SmallVector<Value>>
+  unpackInputs(Location loc, triton::ReduceOp op, OpAdaptor adaptor,
+               ConversionPatternRewriter &rewriter) const {
+    auto types = op.getInputTypes();
+    auto operands = adaptor.getOperands();
+    unsigned srcElems = getTotalElemsPerThread(types[0]);
+    SmallVector<SmallVector<Value>> srcValues(srcElems);
+    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+      auto values = unpackLLElements(loc, operands[i], rewriter);
+
+      assert(values.size() == srcValues.size());
+      for (unsigned j = 0; j < srcValues.size(); ++j) {
+        srcValues[j].push_back(values[j]);
+      }
+    }
+    return srcValues;
+  }
+
+  void sync(ConversionPatternRewriter &rewriter, Location loc,
+            triton::ReduceOp op) const {
+    barrier();
+  }
+
+  // Reduce along op axis for elements that are in the same thread. The
+  // accumulated value is stored in accs.
+  void reduceWithinThreads(
+      ReduceOpHelper &helper, SmallVector<SmallVector<Value>> &srcValues,
+      std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
+      std::map<SmallVector<unsigned>, SmallVector<Value>> &indices,
+      ConversionPatternRewriter &rewriter) const {
+    triton::ReduceOp op = helper.getOperation();
+    RankedTensorType operandType = op.getInputTypes()[0];
+    // Assumes offsets don't actually depend on type
+    SmallVector<SmallVector<unsigned>> offsets =
+        emitOffsetForLayout(helper.getSrcLayout(), operandType);
+
+    // Thread X might hold the same input value in two registers.  Get the
+    // indices in `offsets` that hold unique values, and only accumulate over
+    // those.
+    llvm::MapVector<ArrayRef<unsigned>, int> uniqueOffsets;
+    for (int i = 0; i < offsets.size(); ++i) {
+      uniqueOffsets.insert({offsets[i], i});
+    }
+
+    unsigned srcElems = getTotalElemsPerThread(operandType);
+    auto *combineOp = &op.getCombineOp();
+    auto srcIndices = emitIndices(op.getLoc(), rewriter, targetInfo,
+                                  helper.getSrcLayout(), operandType, true);
+    // reduce within threads
+    for (const auto &[_, i] : uniqueOffsets) {
+      SmallVector<unsigned> key = offsets[i];
+      key[op.getAxis()] = 0;
+      bool isFirst = accs.find(key) == accs.end();
+      accumulate(op.getLoc(), rewriter, *combineOp, accs[key], srcValues[i]);
+      if (isFirst)
+        indices[key] = srcIndices[i];
+    }
+  }
+
+  // Apply warp reduction across the given number of contiguous lanes using op
+  // region and the accumulator values as source.
+  void warpReduce(ConversionPatternRewriter &rewriter, Location loc,
+                  SmallVector<Value> &acc, triton::ReduceOp op,
+                  unsigned numLaneToReduce, unsigned interleave,
+                  Value pred = {}) const {
+    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,
+                                         numLaneToReduce, interleave);
+    if (success)
+      return;
+
+    for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
+      SmallVector<Value> shfl(acc.size());
+      for (unsigned i = 0; i < acc.size(); ++i) {
+        shfl[i] = targetInfo.shuffleXor(rewriter, loc, acc[i], N * interleave);
+      }
+      accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);
+    }
+  }
+
+  // Reduce across threads within each warp.
+  void
+  reduceWithinWarps(ReduceOpHelper &helper,
+                    std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
+                    ConversionPatternRewriter &rewriter) const {
+    triton::ReduceOp op = helper.getOperation();
+    unsigned sizeIntraWarps = helper.getIntraWarpSizeWithUniqueData();
+    unsigned threadOffsetOnReductionAxis =
+        helper.getThreadOffsetOnReductionAxis();
+    for (auto it : accs) {
+      const SmallVector<unsigned> &key = it.first;
+      SmallVector<Value> &acc = accs[key];
+      warpReduce(rewriter, op.getLoc(), acc, op, sizeIntraWarps,
+                 threadOffsetOnReductionAxis);
+    }
+  }
+
+  // Pack the accumulator values and replace the reduce op with the result.
+  void packResults(ReduceOpHelper &helper,
+                   std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
+                   ConversionPatternRewriter &rewriter) const {
+    triton::ReduceOp op = helper.getOperation();
+    Location loc = op.getLoc();
+    unsigned axis = op.getAxis();
+    SmallVector<Value> results(op.getNumOperands());
+    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+      if (auto resultTy =
+              dyn_cast<RankedTensorType>(op.getResult()[i].getType())) {
+        auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
+        unsigned resultElems = getTotalElemsPerThread(resultTy);
+        SmallVector<SmallVector<unsigned>> resultOffset =
+            emitOffsetForLayout(resultLayout, resultTy);
+        SmallVector<Value> resultVals;
+        for (int j = 0; j < resultElems; j++) {
+          auto key = resultOffset[j];
+          key.insert(key.begin() + axis, 0);
+          resultVals.push_back(accs[key][i]);
+        }
+        results[i] = packLLElements(loc, getTypeConverter(), resultVals,
+                                    rewriter, resultTy);
+      } else
+        results[i] = accs.begin()->second[i];
+    }
+    rewriter.replaceOp(op, results);
+  }
+
+  void storeWarpReduceToSharedMemory(
+      ReduceOpHelper &helper,
+      std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
+      std::map<SmallVector<unsigned>, SmallVector<Value>> &indices,
+      SmallVector<Value> &smemBases,
+      ConversionPatternRewriter &rewriter) const {
+    triton::ReduceOp op = helper.getOperation();
+    Location loc = op.getLoc();
+    Value threadId = getThreadId(rewriter, loc);
+    auto srcLayout =
+        mlir::cast<DistributedEncodingTrait>(helper.getSrcLayout());
+    auto mod = op.getOperation()->getParentOfType<ModuleOp>();
+    Value warpSize =
+        i32_val(triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod));
+    Value warpId = udiv(threadId, warpSize);
+    Value laneId = urem(threadId, warpSize);
+    unsigned axis = op.getAxis();
+    auto smemShape = helper.getScratchRepShape();
+
+    // Lezcano: We should move all the shared memory logic to use LLs natively
+    auto srcShape = helper.getSrcShape();
+    auto kLane = rewriter.getStringAttr("lane");
+    auto [multiDimLaneId, isRepresentativeLane] =
+        delinearize(rewriter, loc, srcLayout, srcShape, kLane, laneId);
+    auto kWarp = rewriter.getStringAttr("warp");
+    auto [multiDimWarpId, isRepresentativeWarp] =
+        delinearize(rewriter, loc, srcLayout, srcShape, kWarp, warpId);
+
+    Value laneIdAxis = multiDimLaneId[axis];
+    Value laneZero = icmp_eq(laneIdAxis, i32_val(0));
+    Value write =
+        and_(and_(isRepresentativeLane, isRepresentativeWarp), laneZero);
+
+    Value warpIdAxis = multiDimWarpId[axis];
+
+    auto smemOrder = helper.getOrderWithAxisAtBeginning();
+    for (auto it : accs) {
+      const SmallVector<unsigned> &key = it.first;
+      SmallVector<Value> &acc = it.second;
+
+      SmallVector<Value> writeIdx = indices[key];
+      writeIdx[axis] = warpIdAxis;
+      Value writeOffset =
+          linearize(rewriter, loc, writeIdx, smemShape, smemOrder);
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto elemTy = getElementType(op, i);
+        Value writePtr =
+            gep(smemBases[i].getType(), elemTy, smemBases[i], writeOffset);
+        targetInfo.storeShared(rewriter, loc, writePtr, acc[i], write);
+      }
+    }
+  }
+
+  // Load the reduction of each warp and accumulate them to a final value and
+  // store back to shared memory.
+  void accumulatePartialReductions(ReduceOpHelper &helper,
+                                   SmallVector<Value> &smemBases,
+                                   ConversionPatternRewriter &rewriter) const {
+    triton::ReduceOp op = helper.getOperation();
+    auto smemShape = helper.getScratchRepShape();
+    unsigned elems = product<unsigned>(smemShape);
+    unsigned sizeInterWarps = helper.getInterWarpSizeWithUniqueData();
+    Location loc = op.getLoc();
+
+    auto mod = op.getOperation()->getParentOfType<ModuleOp>();
+    int numLanes = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
+    int numThreads = numLanes * numWarps;
+
+    Value threadId = getThreadId(rewriter, loc);
+    Value warpSize = i32_val(numLanes);
+    Value laneId = urem(threadId, warpSize);
+    Value zero = i32_val(0);
+
     unsigned elemsPerThread = std::max<unsigned>(elems / numThreads, 1);
+    Value threadIsNeeded = icmp_slt(threadId, i32_val(elems));
     Value readOffset = threadId;
     for (unsigned round = 0; round < elemsPerThread; ++round) {
-      Value readPtr = gep(elemPtrTy, smemBase, readOffset);
-      // FIXME(Qingyi): need predicate icmp_slt(threadId,
-      // i32_val(sizeInerWarps))
-      Value acc = load(readPtr);
-      Value accIndex;
-      if (withIndex) {
-        Value readIndexPtr = gep(indexPtrTy, indexSmemBase, readOffset);
-        accIndex = load(readIndexPtr);
+      SmallVector<Value> acc(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto elemTy = getElementType(op, i);
+        Value readPtr =
+            gep(smemBases[i].getType(), elemTy, smemBases[i], readOffset);
+        acc[i] = targetInfo.loadShared(rewriter, loc, readPtr, elemTy,
+                                       threadIsNeeded);
       }
-
-      for (unsigned N = sizeInterWarps / 2; N > 0; N >>= 1) {
-        Value shfl = shflSync(loc, rewriter, acc, N);
-        if (!withIndex) {
-          accumulate(rewriter, loc, op.getRedOp(), acc, shfl, false);
-        } else {
-          Value shflIndex = shflSync(loc, rewriter, accIndex, N);
-          accumulateWithIndex(rewriter, loc, op.getRedOp(), acc, accIndex, shfl,
-                              shflIndex, false);
-        }
-      }
-
+      warpReduce(rewriter, loc, acc, op, sizeInterWarps, 1 /* interleave */,
+                 threadIsNeeded);
       // only the first thread in each sizeInterWarps is writing
       Value writeOffset = readOffset;
-      Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
-      Value threadIsNeeded = icmp_slt(threadId, i32_val(elems));
+      SmallVector<Value> writePtrs(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto elemTy = getElementType(op, i);
+        writePtrs[i] =
+            gep(smemBases[i].getType(), elemTy, smemBases[i], writeOffset);
+      }
+
       Value laneIdModSizeInterWarps = urem(laneId, i32_val(sizeInterWarps));
       Value laneIdModSizeInterWarpsIsZero =
           icmp_eq(laneIdModSizeInterWarps, zero);
       Value pred = and_(threadIsNeeded, laneIdModSizeInterWarpsIsZero);
-      storeShared(rewriter, loc, writePtr, acc, pred);
-      if (withIndex) {
-        Value writeIndexPtr = gep(indexPtrTy, indexSmemBase, writeOffset);
-        storeShared(rewriter, loc, writeIndexPtr, accIndex, pred);
+
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        targetInfo.storeShared(rewriter, loc, writePtrs[i], acc[i], pred);
       }
 
       if (round != elemsPerThread - 1) {
         readOffset = add(readOffset, i32_val(numThreads));
       }
     }
+  }
 
-    // We could avoid this barrier in some of the layouts, however this is not
-    // the general case.
-    // TODO: optimize the barrier incase the layouts are accepted.
-    barrier();
+  // Load the final reduction from shared memory and replace the reduce result
+  // with it.
+  void loadReductionAndPackResult(ReduceOpHelper &helper,
+                                  SmallVector<unsigned> smemShape,
+                                  SmallVector<Value> &smemBases,
+                                  ConversionPatternRewriter &rewriter) const {
+    triton::ReduceOp op = helper.getOperation();
+    Location loc = op.getLoc();
+    auto srcLayout = helper.getSrcLayout();
+    auto axis = op.getAxis();
+    auto smemOrder = helper.getOrderWithAxisAtBeginning();
+    SmallVector<Value> results(op.getNumOperands());
+    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+      auto elemTy = getElementType(op, i);
+      if (auto resultTy =
+              dyn_cast<RankedTensorType>(op.getResult()[i].getType())) {
+        // nd-tensor where n >= 1
+        auto resultLayout = cast<SliceEncodingAttr>(resultTy.getEncoding());
+        unsigned resultElems = getTotalElemsPerThread(resultTy);
+        auto resultIndices = emitIndices(loc, rewriter, targetInfo,
+                                         resultLayout, resultTy, true);
+        auto resultShape = resultTy.getShape();
+        auto resultCTATile = getShapePerCTATile(resultLayout);
+        assert(resultIndices.size() == resultElems);
 
-    // set output values
-    if (auto resultTy = op.getType().dyn_cast<RankedTensorType>()) {
-      // nd-tensor where n >= 1
-      auto resultLayout = resultTy.getEncoding().cast<SliceEncodingAttr>();
-      auto resultShape = resultTy.getShape();
-      unsigned resultElems = getElemsPerThread(resultTy);
-      auto resultIndices =
-          emitIndices(loc, rewriter, resultLayout, resultShape);
-      assert(resultIndices.size() == resultElems);
+        SmallVector<Value> resultVals(resultElems);
+        for (size_t j = 0; j < resultElems; ++j) {
+          SmallVector<Value> readIdx = resultIndices[j];
+          readIdx.insert(readIdx.begin() + op.getAxis(), i32_val(0));
+          for (size_t resultIdx = 0, resultDim = resultShape.size();
+               resultIdx < resultDim; ++resultIdx) {
+            auto smemIdx = resultIdx < op.getAxis() ? resultIdx : resultIdx + 1;
+            if (resultCTATile[resultIdx] > smemShape[smemIdx] ||
+                resultShape[resultIdx] > smemShape[smemIdx]) {
+              // When srcShape smaller then src sizePerThread, only srcShape
+              // elements is accumulated in smem. Modulo smemShape effectively
+              // replicates srcShape elements to src sizePerThread.
+              readIdx[smemIdx] =
+                  urem(readIdx[smemIdx], i32_val(smemShape[smemIdx]));
+            }
+          }
+          Value readOffset =
+              linearize(rewriter, loc, readIdx, smemShape, smemOrder);
+          Value readPtr =
+              gep(smemBases[i].getType(), elemTy, smemBases[i], readOffset);
+          resultVals[j] = load(elemTy, readPtr);
+        }
 
-      SmallVector<Value> resultVals(resultElems);
-      for (size_t i = 0; i < resultElems; ++i) {
-        SmallVector<Value> readIdx = resultIndices[i];
-        readIdx.insert(readIdx.begin() + axis, i32_val(0));
-        Value readOffset =
-            linearize(rewriter, loc, readIdx, smemShapes[0], order);
-        Value readPtr = gep(elemPtrTy, smemBase, readOffset);
-        Value indexReadPtr = gep(indexPtrTy, indexSmemBase, readOffset);
-        resultVals[i] = withIndex ? load(indexReadPtr) : load(readPtr);
+        results[i] = packLLElements(loc, getTypeConverter(), resultVals,
+                                    rewriter, resultTy);
+      } else {
+        // 0d-tensor -> scalar
+        results[i] = load(elemTy, smemBases[i]);
       }
-
-      SmallVector<Type> resultTypes(resultElems,
-                                    withIndex ? llvmIndexTy : llvmElemTy);
-      Type structTy =
-          LLVM::LLVMStructType::getLiteral(this->getContext(), resultTypes);
-      Value ret = getStructFromElements(loc, resultVals, rewriter, structTy);
-      rewriter.replaceOp(op, ret);
-    } else {
-      // 0d-tensor -> scalar
-      Value resultVal = withIndex ? load(indexSmemBase) : load(smemBase);
-      rewriter.replaceOp(op, resultVal);
     }
-
-    return success();
+    rewriter.replaceOp(op, results);
   }
 };
+} // namespace
 
-void populateReduceOpToLLVMPatterns(
-    mlir::LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    int numWarps, AxisInfoAnalysis &axisInfoAnalysis,
-    const Allocation *allocation, Value smem,
-    ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
-    PatternBenefit benefit) {
-  patterns.add<ReduceOpConversion>(typeConverter, allocation, smem,
-                                   indexCacheInfo, benefit);
+void mlir::triton::populateReduceOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfoBase &targetInfo, PatternBenefit benefit) {
+  patterns.add<ReduceOpConversion>(typeConverter, targetInfo, benefit);
 }

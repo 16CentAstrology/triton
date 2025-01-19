@@ -1,19 +1,16 @@
-add_mlir_conversion_library(TritonToTritonGPU
+add_triton_library(TritonToTritonGPU
+    TritonGPUConversion.cpp
     TritonToTritonGPUPass.cpp
-
-    ADDITIONAL_HEADER_DIRS
-    ${PROJECT_SOURCE_DIR}/include/triton/Conversion/TritonToTritonGPU
 
     DEPENDS
     TritonConversionPassIncGen
 
-    LINK_COMPONENTS
-    Core
-
     LINK_LIBS PUBLIC
     MLIRIR
     MLIRPass
+    MLIRTransforms
     TritonIR
+    ProtonIR
     TritonGPUIR
     TritonGPUTransforms
 )

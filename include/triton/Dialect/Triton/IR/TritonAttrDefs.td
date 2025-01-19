@@ -3,16 +3,32 @@
 
 include "mlir/IR/EnumAttr.td"
 
-// Attrs for LoadOp
+// Attributes for LoadOp and StoreOp
 def TT_CacheModifierAttr : I32EnumAttr<
     "CacheModifier", "",
     [
         I32EnumAttrCase<"NONE", 1, "none">,
         I32EnumAttrCase<"CA", 2, "ca">,
         I32EnumAttrCase<"CG", 3, "cg">,
+        I32EnumAttrCase<"WB", 4, "wb">,
+        I32EnumAttrCase<"CS", 5, "cs">,
+        I32EnumAttrCase<"WT", 6, "wt">,
+        I32EnumAttrCase<"CV", 7, "cv">,
     ]> {
     let cppNamespace = "::mlir::triton";
 }
+
+def TT_MemSemanticAttr : I32EnumAttr<
+    "MemSemantic", "",
+    [
+      I32EnumAttrCase<"RELAXED", 1, "relaxed">,
+      I32EnumAttrCase<"ACQUIRE", 2, "acquire">,
+      I32EnumAttrCase<"RELEASE", 3, "release">,
+      I32EnumAttrCase<"ACQUIRE_RELEASE", 4, "acq_rel">,
+    ]> {
+    let cppNamespace = "::mlir::triton";
+}
+
 def TT_EvictionPolicyAttr : I32EnumAttr<
     "EvictionPolicy", "",
     [
@@ -23,26 +39,12 @@ def TT_EvictionPolicyAttr : I32EnumAttr<
     let cppNamespace = "::mlir::triton";
 }
 
-// reduction
-def TT_RedOpAttr : I32EnumAttr<
-    /*name*/"RedOp", /*summary*/"",
-    /*case*/
+def TT_PaddingOptionAttr : I32EnumAttr<
+    "PaddingOption", "",
     [
-        I32EnumAttrCase</*sym*/"ADD", 1, /*str*/"add">,
-        I32EnumAttrCase<"FADD", 2, "fadd">,
-        I32EnumAttrCase<"MIN", 3, "min">,
-        I32EnumAttrCase<"MAX", 4, "max">,
-        I32EnumAttrCase<"UMIN", 5, "umin">,
-        I32EnumAttrCase<"UMAX", 6, "umax">,
-        I32EnumAttrCase<"ARGMIN", 7, "argmin">,
-        I32EnumAttrCase<"ARGMAX", 8, "argmax">,
-        I32EnumAttrCase<"ARGUMIN", 9, "argumin">,
-        I32EnumAttrCase<"ARGUMAX", 10, "argumax">,
-        I32EnumAttrCase<"FMIN", 11, "fmin">,
-        I32EnumAttrCase<"FMAX", 12, "fmax">,
-        I32EnumAttrCase<"ARGFMIN", 13, "argfmin">,
-        I32EnumAttrCase<"ARGFMAX", 14, "argfmax">,
-        I32EnumAttrCase<"XOR", 15, "xor">
+        I32EnumAttrCase<"PAD_ZERO", 1, "zero">,
+        // We can not set the string value to "NAN" because it is a keyword in C++
+        I32EnumAttrCase<"PAD_NAN", 2, "nan">
     ]> {
     let cppNamespace = "::mlir::triton";
 }
@@ -63,6 +65,73 @@ def TT_AtomicRMWAttr : I32EnumAttr<
         I32EnumAttrCase<"XCHG", 10, "exch">
     ]> {
     let cppNamespace = "::mlir::triton";
+}
+
+def TT_MemSyncScopeAttr : I32EnumAttr<
+    "MemSyncScope", "",
+    [
+      I32EnumAttrCase<"GPU", 1, "gpu">,
+      I32EnumAttrCase<"CTA", 2, "cta">,
+      I32EnumAttrCase<"SYSTEM", 3, "sys">,
+    ]> {
+    let cppNamespace = "::mlir::triton";
+}
+
+// Program ID dimensions.
+def TT_ProgramDim : I32EnumAttr<
+    "ProgramIDDim", "",
+    [
+        I32EnumAttrCase<"X", 0, "x">,
+        I32EnumAttrCase<"Y", 1, "y">,
+        I32EnumAttrCase<"Z", 2, "z">,
+    ]> {
+    let cppNamespace = "::mlir::triton";
+}
+
+// Rounding mode.
+def TT_RoundingModeAttr : I32EnumAttr<
+    "RoundingMode", "",
+    [
+        I32EnumAttrCase<"RTZ", 0, "rtz">,
+        I32EnumAttrCase<"RTNE", 1, "rtne">,
+    ]> {
+    let cppNamespace = "::mlir::triton";
+}
+
+// PropagateNan.
+def TT_PropagateNanAttr : I32EnumAttr<
+    "PropagateNan", "",
+    [
+        I32EnumAttrCase<"NONE", 0, "none">,
+        I32EnumAttrCase<"ALL", 0xFFFF, "all">,
+    ]> {
+    let cppNamespace = "::mlir::triton";
+}
+
+// InputPrecision
+def TT_InputPrecisionAttr : I32EnumAttr<
+    "InputPrecision", "",
+    [
+      I32EnumAttrCase<"TF32", 0, "tf32">,
+      I32EnumAttrCase<"TF32x3", 1, "tf32x3">,
+      I32EnumAttrCase<"IEEE", 2, "ieee">
+    ]>{
+  let cppNamespace = "::mlir::triton";
+}
+
+// Type for ScaleDotElemType kind of floats.
+def TT_ScaleDotElemTypeAttr : I32EnumAttr<
+    "ScaleDotElemType", "",
+    [
+      I32EnumAttrCase<"E4M3", 0, "e4m3">,
+      I32EnumAttrCase<"E5M2", 1, "e5m2">,
+      I32EnumAttrCase<"E2M3", 2, "e2m3">,
+      I32EnumAttrCase<"E3M2", 3, "e3m2">,
+      I32EnumAttrCase<"E2M1", 4, "e2m1">,
+      I32EnumAttrCase<"BF16", 5, "bf16">,
+      I32EnumAttrCase<"FP16", 6, "fp16">
+    ]>{
+  let cppNamespace = "::mlir::triton";
 }
 
 #endif

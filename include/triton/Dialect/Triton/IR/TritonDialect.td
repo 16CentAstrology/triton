@@ -19,7 +19,9 @@ def Triton_Dialect : Dialect {
       * Math:
         * exp, sin, cos, log, ...
       * StructuredControlFlow:
-        * ForOp, IfOp, WhileOp, YieldOp, ConditionOp
+        * for, if, while, yield, condition
+      * ControlFlow:
+        * br, cond_br
   }];
 
   let dependentDialects = [
@@ -27,7 +29,7 @@ def Triton_Dialect : Dialect {
     "math::MathDialect",
     "scf::SCFDialect",
     "cf::ControlFlowDialect",
-    "func::FuncDialect"
+    "ub::UBDialect"
   ];
 
   let extraClassDeclaration = [{
@@ -36,6 +38,7 @@ def Triton_Dialect : Dialect {
 
   let hasConstantMaterializer = 1;
   let useDefaultTypePrinterParser = 1;
+  let usePropertiesForAttributes = 1;
 }
 
 include "triton/Dialect/Triton/IR/TritonTypes.td"
